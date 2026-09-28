@@ -1,0 +1,36 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cf-ai-interview-coach",
+  "main": "src/server.ts",
+  "compatibility_date": "2026-09-11",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // LLM: Workers AI (Llama 3.3 70B). "remote": true lets `npm run dev`
+  // call the real model from your laptop (needs `npx wrangler login`).
+  "ai": { "binding": "AI", "remote": true },
+
+  // Chat UI: the React app is built by Vite and served as static assets.
+  // Requests to /agents/* go to the Worker (WebSocket to the agent).
+  "assets": {
+    "directory": "./public",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/agents/*"]
+  },
+
+  // Memory / state: one Durable Object (with SQLite) per user.
+  "durable_objects": {
+    "bindings": [{ "name": "InterviewCoach", "class_name": "InterviewCoach" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["InterviewCoach"] }],
+
+  // Coordination: durable multi-step feedback-report pipeline.
+  "workflows": [
+    {
+      "name": "feedback-report-workflow",
+      "binding": "FEEDBACK_REPORT_WORKFLOW",
+      "class_name": "FeedbackReportWorkflow"
+    }
+  ],
+
+  "observability": { "enabled": true }
+}
