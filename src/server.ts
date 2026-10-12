@@ -2,6 +2,7 @@ import { AIChatAgent, type OnChatMessageOptions } from "@cloudflare/ai-chat";
 import { callable, routeAgentRequest } from "agents";
 import { createWorkersAI } from "workers-ai-provider";
 import {
+  NoSuchToolError,
   convertToModelMessages,
   pruneMessages,
   stepCountIs,
@@ -29,6 +30,52 @@ const looseString = z.union([z.string(), z.number()]).nullish();
 const looseNumber = z.union([z.number(), z.string()]).nullish();
 const looseList = z.union([z.array(z.string()), z.string()]).nullish();
 
+/** Llama sometimes nests the real arguments: {"parameters": {...}} or a JSON string. */
+function unwrapArgs(input: Record<string, unknown>): Record<string, unknown> {
+  for (const key of ["parameters", "arguments", "args", "input"]) {
+    let inner = input[key];
+    if (typeof inner === "string") {
+      try {
+        inner = JSON.parse(inner);
+      } catch {
+        continue;
+      }
+    }
+    if (inner && typeof inner === "object" && !Array.isArray(inner)) {
+      return { ...input, ...(inner as Record<string, unknown>) };
+    }
+  }
+  return input;
+}
+
+/** Turns whatever the model sent into a flat object of strings / numbers / string arrays. */
+function sanitizeArgs(raw: unknown): Record<string, unknown> {
+  let v: unknown = raw;
+  for (let i = 0; i < 2 && typeof v === "string"; i++) {
+    try {
+      v = JSON.parse(v);
+    } catch {
+      v = {};
+    }
+  }
+  if (!v || typeof v !== "object" || Array.isArray(v)) return {};
+  const obj = unwrapArgs(v as Record<string, unknown>);
+  const out: Record<string, unknown> = {};
+  for (const [k, x] of Object.entries(obj)) {
+    if (x == null) continue;
+    if (Array.isArray(x)) {
+      out[k] = x.map((e) => (e && typeof e === "object" ? JSON.stringify(e) : String(e)));
+    } else if (typeof x === "object") {
+      out[k] = JSON.stringify(x);
+    } else if (typeof x === "boolean") {
+      out[k] = String(x);
+    } else {
+      out[k] = x;
+    }
+  }
+  return out;
+}
+
 function toStr(v: unknown): string | undefined {
   if (v == null) return undefined;
   const s = String(v).trim();
@@ -42,7 +89,26 @@ function toNum(v: unknown): number | undefined {
 }
 
 function toList(v: unknown): string[] {
-  if (Array.isArray(v)) return v.map(String).map((s) => s.trim()).filter(Boolean);
+  if (Array.isArray(v)) {
+    return v
+      .map((e) => {
+        if (e && typeof e === "object") {
+          const o = e as Record<string, unknown>;
+          return String(o.name ?? o.topic ?? o.value ?? Object.values(o)[0] ?? "");
+        }
+        const s = String(e);
+        if (s.startsWith("{")) {
+          try {
+            return toList([JSON.parse(s)])[0] ?? s;
+          } catch {
+            return s;
+          }
+        }
+        return s;
+      })
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
   const s = toStr(v);
   if (!s) return [];
   if (s.startsWith("[")) {
@@ -113,14 +179,34 @@ export class InterviewCoach extends AIChatAgent<Env, CoachState> {
       // Loop guard: once a tool has run in this reply, hide it for the
       // remaining steps so the model must answer instead of re-calling it.
       prepareStep: ({ steps }) => {
-        const used = new Set(steps.flatMap((s) => s.toolCalls.map((c) => c.toolName)));
+        const used = new Set<string>();
+        for (const s of steps) {
+          for (const part of s.content as Array<{ type: string; toolName?: string }>) {
+            if ((part.type === "tool-call" || part.type === "tool-error") && part.toolName) {
+              used.add(part.toolName);
+            }
+          }
+        }
         return { activeTools: allTools.filter((t) => !used.has(t)) };
+      },
+      // If the model sends malformed arguments, clean them up instead of failing.
+      repairToolCall: async ({ toolCall, error }) => {
+        if (NoSuchToolError.isInstance(error)) return null;
+        console.warn("repairing tool call", toolCall.toolName, toolCall.input, String(error));
+        return { ...toolCall, input: JSON.stringify(sanitizeArgs(toolCall.input)) };
       },
       stopWhen: stepCountIs(4),
       abortSignal: options?.abortSignal
     });
 
-    return result.toUIMessageStreamResponse();
+    return result.toUIMessageStreamResponse({
+      // Show the real error text in the UI (and in Cloudflare logs) instead of
+      // the default "An error occurred."
+      onError: (error) => {
+        console.error("chat error", error);
+        return error instanceof Error ? error.message : String(error);
+      }
+    });
   }
 
   /** The system prompt is rebuilt every turn from memory, so the coach
@@ -179,8 +265,9 @@ HOW TO RUN THE INTERVIEW
             "One of: dsa, system-design, lld, behavioral, mixed"
           ),
           focusAreas: looseList.describe("Topics to focus on, e.g. ['kafka', 'caching']")
-        }),
-        execute: async (input) => {
+        }).passthrough(),
+        execute: async (raw) => {
+          const input = unwrapArgs(raw);
           const prev = this.state.profile;
           const profile: Profile = {
             name: toStr(input.name) ?? prev?.name,
@@ -207,8 +294,9 @@ HOW TO RUN THE INTERVIEW
           score: looseNumber.describe("Score from 1 (poor) to 10 (excellent)"),
           strengths: looseString.describe("One line: what was good"),
           gaps: looseString.describe("One line: what was missing or wrong")
-        }),
-        execute: async (e) => {
+        }).passthrough(),
+        execute: async (raw) => {
+          const e = unwrapArgs(raw);
           const score = toNum(e.score);
           if (score == null) {
             return { recorded: false, error: "score must be a number from 1 to 10" };
