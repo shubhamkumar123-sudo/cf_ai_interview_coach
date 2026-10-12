@@ -1,8 +1,7 @@
 # cf_ai_interview_coach
 
 An AI mock-interview coach that runs entirely on Cloudflare. It asks interview questions tailored to your target role, scores every answer, **remembers your weak topics across sessions**, and runs a durable **Workflow** that turns your answers into a feedback report and a 5-day study plan. You can type or **answer by voice**.
-
-> **Live demo:** `https://cf-ai-interview-coach.<your-subdomain>.workers.dev` ← _replace after `npm run deploy`_
+> **Live demo:** https://cf-ai-interview-coach.kumar-shubham90908-3b4.workers.dev
 
 ## How it meets the assignment
 
@@ -48,7 +47,7 @@ Worker ── routeAgentRequest ──► InterviewCoach  (Durable Object, one p
 Prerequisites: Node.js 20+ and a free Cloudflare account (Workers AI has a free daily allowance).
 
 ```bash
-git clone https://github.com/<you>/cf_ai_interview_coach.git
+git clone git clone https://github.com/shubhamkumar123-sudo/cf_ai_interview_coach.git
 cd cf_ai_interview_coach
 npm install
 npx wrangler login        # Workers AI runs remotely even in local dev
