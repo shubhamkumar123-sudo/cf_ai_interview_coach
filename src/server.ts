@@ -3,6 +3,8 @@ import { callable, routeAgentRequest } from "agents";
 import { createWorkersAI } from "workers-ai-provider";
 import {
   NoSuchToolError,
+  wrapLanguageModel,
+  type LanguageModelMiddleware,
   convertToModelMessages,
   pruneMessages,
   stepCountIs,
@@ -23,6 +25,15 @@ import {
 } from "./shared";
 
 export { FeedbackReportWorkflow } from "./workflow";
+
+/** When a step sets toolChoice "none", send no tools at all to Workers AI.
+ *  Llama ignores tool_choice:"none" and copies earlier tool calls otherwise. */
+const stripToolsWhenNone: LanguageModelMiddleware = {
+  transformParams: async ({ params }) =>
+    params.toolChoice?.type === "none"
+      ? { ...params, tools: undefined, toolChoice: undefined }
+      : params
+};
 
 // ── Lenient tool-argument helpers ─────────────────────────────────────────
 
@@ -165,11 +176,9 @@ export class InterviewCoach extends AIChatAgent<Env, CoachState> {
     const workersai = createWorkersAI({ binding: this.env.AI });
 
     const tools = this.tools();
-    type ToolName = keyof typeof tools;
-    const allTools = Object.keys(tools) as ToolName[];
 
     const result = streamText({
-      model: workersai(MODEL),
+      model: wrapLanguageModel({ model: workersai(MODEL), middleware: stripToolsWhenNone }),
       system: this.buildSystemPrompt(),
       messages: pruneMessages({
         messages: await convertToModelMessages(this.messages),
@@ -178,24 +187,17 @@ export class InterviewCoach extends AIChatAgent<Env, CoachState> {
       tools,
       // Loop guard: once a tool has run in this reply, hide it for the
       // remaining steps so the model must answer instead of re-calling it.
-      prepareStep: ({ steps }) => {
-        const used = new Set<string>();
-        for (const s of steps) {
-          for (const part of s.content as Array<{ type: string; toolName?: string }>) {
-            if ((part.type === "tool-call" || part.type === "tool-error") && part.toolName) {
-              used.add(part.toolName);
-            }
-          }
-        }
-        return { activeTools: allTools.filter((t) => !used.has(t)) };
-      },
+      // Loop guard: after the first round of tool calls, the model may only
+      // write text. The middleware below then strips the tool list from the
+      // request, so Llama cannot call (or re-call) any tool.
+      prepareStep: ({ steps }) => (steps.length > 0 ? { toolChoice: "none" as const } : {}),
       // If the model sends malformed arguments, clean them up instead of failing.
       repairToolCall: async ({ toolCall, error }) => {
         if (NoSuchToolError.isInstance(error)) return null;
         console.warn("repairing tool call", toolCall.toolName, toolCall.input, String(error));
         return { ...toolCall, input: JSON.stringify(sanitizeArgs(toolCall.input)) };
       },
-      stopWhen: stepCountIs(4),
+      stopWhen: stepCountIs(3),
       abortSignal: options?.abortSignal
     });
 
