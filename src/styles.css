@@ -67,6 +67,7 @@ button, textarea { font: inherit; color: inherit; }
   color: var(--muted); width: fit-content;
 }
 .tool-chip.done { border-style: solid; }
+.tool-chip.error { border-style: solid; border-color: var(--weak); color: var(--weak); }
 .typing { color: var(--muted); font-size: 13px; }
 
 .empty { margin: auto; max-width: 560px; text-align: center; }

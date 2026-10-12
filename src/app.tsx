@@ -111,7 +111,14 @@ function Message({ msg }: { msg: UIMessage }) {
             </div>
           );
         }
-        if (isToolUIPart(part)) {
+                if (isToolUIPart(part)) {
+          if (part.state === "output-error") {
+            return (
+              <div key={i} className="tool-chip error" title={part.errorText}>
+                ⚠️ {getToolName(part)} failed{part.errorText ? `: ${part.errorText.slice(0, 120)}` : ""}
+              </div>
+            );
+          }
           const done = part.state === "output-available";
           return (
             <div key={i} className={`tool-chip ${done ? "done" : ""}`}>

@@ -15,11 +15,55 @@ import {
   type CoachState,
   type Evaluation,
   type FeedbackReport,
+  type InterviewType,
+  type Profile,
   type ReportWorkflowParams,
   type TopicStat
 } from "./shared";
 
 export { FeedbackReportWorkflow } from "./workflow";
+
+// ── Lenient tool-argument helpers ─────────────────────────────────────────
+
+const looseString = z.union([z.string(), z.number()]).nullish();
+const looseNumber = z.union([z.number(), z.string()]).nullish();
+const looseList = z.union([z.array(z.string()), z.string()]).nullish();
+
+function toStr(v: unknown): string | undefined {
+  if (v == null) return undefined;
+  const s = String(v).trim();
+  return s && s.toLowerCase() !== "null" && s.toLowerCase() !== "unknown" ? s : undefined;
+}
+
+function toNum(v: unknown): number | undefined {
+  if (v == null || v === "") return undefined;
+  const n = typeof v === "number" ? v : parseFloat(String(v)); // "7/10" -> 7
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function toList(v: unknown): string[] {
+  if (Array.isArray(v)) return v.map(String).map((s) => s.trim()).filter(Boolean);
+  const s = toStr(v);
+  if (!s) return [];
+  if (s.startsWith("[")) {
+    try {
+      return toList(JSON.parse(s));
+    } catch {
+      /* fall through */
+    }
+  }
+  return s.split(",").map((x) => x.trim()).filter(Boolean);
+}
+
+function toInterviewType(v: unknown): InterviewType | undefined {
+  const s = toStr(v)?.toLowerCase().replace(/[\s_]+/g, "-");
+  if (!s) return undefined;
+  if (s.includes("system")) return "system-design";
+  if (s.includes("lld") || s.includes("low-level")) return "lld";
+  if (s.includes("dsa") || s.includes("algo") || s.includes("data-struct")) return "dsa";
+  if (s.includes("behav")) return "behavioral";
+  return "mixed";
+}
 
 /**
  * One InterviewCoach instance (a Durable Object) exists per user.
@@ -54,6 +98,10 @@ export class InterviewCoach extends AIChatAgent<Env, CoachState> {
   async onChatMessage(_onFinish: unknown, options?: OnChatMessageOptions) {
     const workersai = createWorkersAI({ binding: this.env.AI });
 
+    const tools = this.tools();
+    type ToolName = keyof typeof tools;
+    const allTools = Object.keys(tools) as ToolName[];
+
     const result = streamText({
       model: workersai(MODEL),
       system: this.buildSystemPrompt(),
@@ -61,8 +109,14 @@ export class InterviewCoach extends AIChatAgent<Env, CoachState> {
         messages: await convertToModelMessages(this.messages),
         toolCalls: "before-last-2-messages"
       }),
-      tools: this.tools(),
-      stopWhen: stepCountIs(6),
+      tools,
+      // Loop guard: once a tool has run in this reply, hide it for the
+      // remaining steps so the model must answer instead of re-calling it.
+      prepareStep: ({ steps }) => {
+        const used = new Set(steps.flatMap((s) => s.toolCalls.map((c) => c.toolName)));
+        return { activeTools: allTools.filter((t) => !used.has(t)) };
+      },
+      stopWhen: stepCountIs(4),
       abortSignal: options?.abortSignal
     });
 
@@ -93,7 +147,7 @@ export class InterviewCoach extends AIChatAgent<Env, CoachState> {
 - Questions answered so far: ${questionsAnswered}
 ${weakest ? `WEAKEST TOPICS SO FAR:\n${weakest}` : "No answers scored yet."}
 ${latestReport ? `LAST REPORT HEADLINE: ${latestReport.headline}` : ""}`
-      : `No profile yet. Start by briefly asking the candidate for their target role, years of experience, interview type (dsa, system-design, lld, behavioral or mixed) and focus areas, then call saveProfile.`;
+      : `No profile yet. Start by briefly asking the candidate for their target role, years of experience, interview type (dsa, system-design, lld, behavioral or mixed) and focus areas, then call saveProfile once with whatever they told you (leave unknown fields out) and ask the first question.`;
 
     return `You are "Coach", a friendly but rigorous technical interviewer running mock interviews for software engineers.
 
@@ -105,7 +159,8 @@ HOW TO RUN THE INTERVIEW
 3. If they say "skip" or "hint", help without scoring.
 4. If they ask how they are doing, call getProgress.
 5. If they ask for a report, summary or study plan, or say they are done, call generateFeedbackReport and tell them it is being generated in the sidebar.
-6. Keep replies concise and use Markdown. Never invent scores that were not recorded.`;
+6. Keep replies concise and use Markdown. Never invent scores that were not recorded.
+7. Call each tool at most ONCE per reply. After a tool returns, do not call it again; write your reply to the candidate.`;
   }
 
   private tools() {
@@ -113,21 +168,31 @@ HOW TO RUN THE INTERVIEW
       saveProfile: tool({
         description:
           "Save or update the candidate's profile in long-term memory. Call after learning their target role, experience, interview type or focus areas.",
+        // Schemas are deliberately lenient: Llama often sends null for unknown
+        // fields, numbers as strings, or a list as a single string. Strict
+        // schemas make every call fail and the model retries in a loop.
         inputSchema: z.object({
-          name: z.string().optional().describe("Candidate's first name"),
-          targetRole: z.string().describe("e.g. 'Senior Backend Engineer'"),
-          yearsOfExperience: z.coerce.number().optional(),
-          interviewType: z
-            .enum(["dsa", "system-design", "lld", "behavioral", "mixed"])
-            .describe("Kind of interview to practise"),
-          focusAreas: z
-            .array(z.string())
-            .default([])
-            .describe("Topics to focus on, e.g. ['kafka', 'caching']")
+          name: looseString.describe("Candidate's first name, if given"),
+          targetRole: looseString.describe("e.g. 'Senior Backend Engineer'"),
+          yearsOfExperience: looseNumber.describe("Years of experience, if given"),
+          interviewType: looseString.describe(
+            "One of: dsa, system-design, lld, behavioral, mixed"
+          ),
+          focusAreas: looseList.describe("Topics to focus on, e.g. ['kafka', 'caching']")
         }),
-        execute: async (profile) => {
+        execute: async (input) => {
+          const prev = this.state.profile;
+          const profile: Profile = {
+            name: toStr(input.name) ?? prev?.name,
+            targetRole: toStr(input.targetRole) ?? prev?.targetRole ?? "Software Engineer",
+            yearsOfExperience: toNum(input.yearsOfExperience) ?? prev?.yearsOfExperience,
+            interviewType: toInterviewType(input.interviewType) ?? prev?.interviewType ?? "mixed",
+            focusAreas: toList(input.focusAreas).length
+              ? toList(input.focusAreas)
+              : (prev?.focusAreas ?? [])
+          };
           this.setState({ ...this.state, profile });
-          return { saved: true, profile };
+          return { saved: true, profile, next: "Profile saved. Now ask the first interview question." };
         }
       }),
 
@@ -135,15 +200,27 @@ HOW TO RUN THE INTERVIEW
         description:
           "Record the score for the candidate's answer to the last question. Call this after every real answer.",
         inputSchema: z.object({
-          topic: z
-            .string()
-            .describe("Short lowercase topic, e.g. 'rate limiting', 'graphs', 'caching'"),
-          question: z.string().describe("The question that was answered"),
-          score: z.coerce.number().min(1).max(10).describe("1 = poor, 10 = excellent"),
-          strengths: z.string().describe("One line: what was good"),
-          gaps: z.string().describe("One line: what was missing or wrong")
+          topic: looseString.describe(
+            "Short lowercase topic, e.g. 'rate limiting', 'graphs', 'caching'"
+          ),
+          question: looseString.describe("The question that was answered"),
+          score: looseNumber.describe("Score from 1 (poor) to 10 (excellent)"),
+          strengths: looseString.describe("One line: what was good"),
+          gaps: looseString.describe("One line: what was missing or wrong")
         }),
-        execute: async (e) => this.recordEvaluation(e)
+        execute: async (e) => {
+          const score = toNum(e.score);
+          if (score == null) {
+            return { recorded: false, error: "score must be a number from 1 to 10" };
+          }
+          return this.recordEvaluation({
+            topic: toStr(e.topic) ?? "general",
+            question: toStr(e.question) ?? "(question not given)",
+            score,
+            strengths: toStr(e.strengths) ?? "",
+            gaps: toStr(e.gaps) ?? ""
+          });
+        }
       }),
 
       getProgress: tool({
